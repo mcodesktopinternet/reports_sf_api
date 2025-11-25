@@ -83,7 +83,7 @@ def etl_geovane_base_original():
         WorkOrder__r.Priority,
         ServiceTerritory.Name
     FROM ServiceAppointment 
-    WHERE WorkOrder__r.CreatedDate >= 2025-07-01T00:00:00.000-03:00
+    WHERE WorkOrder__r.CreatedDate >= 2025-08-01T00:00:00.000-03:00
     """
     
     # WHERE WorkOrder__r.CreatedDate >= N_MONTHS_AGO:3 and (WorkOrder__r.LastModifiedDate >= N_DAYS_AGO:1 or LastModifiedDate >= N_DAYS_AGO:1)
@@ -189,8 +189,8 @@ def etl_geovane_base_original():
     conn = conectar_mysql(
         host="172.29.5.3",
         database="db_Melhoria_continua_operacoes",
-        user="Danilo.Vargas",
-        password="xO09E6MHhVf&£M{$4"
+        user="Geovane.Faria",
+        password="GeovaneDesk2@25"
     )
 
     if conn:
