@@ -1,6 +1,7 @@
-from sf_auth import get_salesforce_token, get_auth_headers
+from sf_auth import get_salesforce_token , get_auth_headers
 from sf_query import get_all_query_results
 import pandas as pd
+# import json
 from convert_timestamp_column import convert_timestamp_column
 from conectar_mysql import conectar_mysql
 from conectar_mysql import insert_dataframe_mysql_direct
@@ -8,14 +9,18 @@ from conectar_mysql import insert_dataframe_mysql_direct
 
 def etl_richard_critical():
 
-    # =====================================================
-    # SALESFORCE AUTH
-    # =====================================================
-    domain = "https://desktopsa.my.salesforce.com"
-    client_id = "3MVG99gP.VbJma8WslD5o_qMP_J4iVg1FUTtQzWQ4_TxpBoZWi6MyFHtxCZMZFOCk2FsJbw2wNynhmaD7c8Uv"
-    client_secret = "E31D29879301886FE62D60D79898EE335B488E0A37E4DDB9874D12F12C29719E"
-    username = "plan.relatorios@desktop.net.br"
-    password = "PlanRelatorios@2025PwdjW2bnaqa3Z8O7KwuqVoLp"
+
+    domain="https://desktopsa.my.salesforce.com"
+    client_id="3MVG99gP.VbJma8WslD5o_qMP_J4iVg1FUTtQzWQ4_TxpBoZWi6MyFHtxCZMZFOCk2FsJbw2wNynhmaD7c8Uv"
+    client_secret="E31D29879301886FE62D60D79898EE335B488E0A37E4DDB9874D12F12C29719E"
+    username="plan.relatorios@desktop.net.br"
+    password="PlanRelatorios@2025PwdjW2bnaqa3Z8O7KwuqVoLp"
+
+    # domain="https://desktopsa--partial.sandbox.my.salesforce.com"
+    # client_id="3MVG96WMoUG6yB9I08P9CSL6cWR7Z8a1BeYJ4eTuaTZsGdqfcQf4jEI1gKO8b9xEeJ_TqbMuZ4hI4102covli"
+    # client_secret="1D2CD4C19998FD5FFF3CB2EABD6424455B0D38DDB3F176BCD15A607299F51715"
+    # username="danilo.silva@desktop.tec.br"
+    # password="Desktop@2025T2D1mKr2AfuVPh9i8I9chw9u"
 
     token_data = get_salesforce_token(
         domain=domain,
@@ -27,9 +32,8 @@ def etl_richard_critical():
 
     headers = get_auth_headers(token_data)
 
-    # =====================================================
-    # SOQL (FORMATO CORRETO)
-    # =====================================================
+
+
     query = """
     SELECT
         Id,
@@ -59,7 +63,7 @@ def etl_richard_critical():
         LowCodeFormula__c,
         WorkOrder__r.ReasonForCancellationWorkOrder__c,
         WorkOrder__r.SuspensionReasonWo__c,
-        WorkOrder__r.OLT__r.Name,
+        WorkOrder__r.OLT__r.Name ,
         WorkOrder__r.CTO__c,
         WorkOrder__r.LastModifiedDate,
         WorkOrder__r.IsRescheduledWo__c,
@@ -78,46 +82,22 @@ def etl_richard_critical():
         WorkOrder__r.Case.Owner.Name,
         WorkOrder__r.Case.Area_de_atendimento__c,
         WorkOrder__r.Case.Account.LXD_CPF__c,
-        WorkOrder__r.Criada_critica__c,
-        WorkOrder__r.Priority2__c,
-        WorkOrder__r.Tornou_se_critica__c,
-        WorkOrder__r.ReasonOfCriticality2__c,
-        WorkOrder__r.Prioridade_por_Encaixe__c,
-        WorkOrder__r.Periodo_solicita_encaixe__c,
-        WorkOrder__r.ObservationOnPriority2__c,
-        WorkOrder__r.Data_solicita_o_encaixe__c,
         WorkOrder__r.Agendamento_Fura_Fila__c
     FROM ServiceAppointment
-    WHERE
-        WorkOrder__r.CreatedDate >= 2025-08-11T03:00:00.000Z
-        AND (
-            WorkOrder__r.Priority = 'Critical'
-            OR WorkOrder__r.Priority2__c = 'Critical'
-        )
-        AND WorkOrder__r.Case.Account.LXD_CPF__c != ''
+    WHERE WorkOrder__r.CreatedDate >=2025-08-11T00:00:00.000-03:00 and WorkOrder__r.Priority = 'Critical' and WorkOrder__r.Case.Account.LXD_CPF__c != ''
     """
+        
 
-    resultado = get_all_query_results(
-        instance_url=domain,
-        auth_headers=headers,
-        query=query
-    )
 
-    if not resultado:
-        print("Nenhum dado retornado do Salesforce.")
-        return
+    resultado = get_all_query_results(instance_url="https://desktopsa.my.salesforce.com" , auth_headers=headers, query=query)
 
-    # =====================================================
-    # DATAFRAME
-    # =====================================================
-    df = pd.json_normalize(resultado, sep="_")
+    all_results = pd.json_normalize(resultado, sep="_")
 
-    # remove colunas attributes
-    df.drop(columns=[c for c in df.columns if "attributes_" in c], inplace=True)
+    all_results.fillna("", inplace=True)
 
-    # =====================================================
-    # CONVERSÃO DE DATAS
-    # =====================================================
+    #quero que remova todas as colunas que tem o nome attributes
+    all_results = all_results.drop(columns=[col for col in all_results.columns if 'attributes_' in col])
+
     colunas_timestamp = [
         'ArrivalWindowStart_Gantt__c',
         'ArrivalWindowEnd_Gantt__c',
@@ -127,17 +107,16 @@ def etl_richard_critical():
         'ActualEnd_Gantt__c',
         'WorkOrder__r_dt_abertura__c',
         'WorkOrder__r_DataAgendamento__c',
-        'WorkOrder__r_LastModifiedDate',
-        'WorkOrder__r_Data_solicita_o_encaixe__c'
+        'WorkOrder__r_LastModifiedDate'
     ]
 
-    for col in colunas_timestamp:
-        if col in df.columns:
-            df[col] = convert_timestamp_column(df[col])
+    for coluna in colunas_timestamp:
+        # Adicionado um if para evitar erro caso a consulta falhe e a coluna não exista
+        if coluna in all_results.columns:
+            all_results[coluna] = convert_timestamp_column(all_results[coluna])
 
-    # =====================================================
-    # DE / PARA (EXATAMENTE IGUAL AO MYSQL)
-    # =====================================================
+
+
     colunas_de_para = {
         'Id': 'id',
         'AppointmentNumber': 'numero_compromisso',
@@ -182,37 +161,16 @@ def etl_richard_critical():
         'WorkOrder__r_Case_CaseNumber': 'numero_caso',
         'WorkOrder__r_Asset_Name': 'ativo',
         'WorkOrder__r_Case_Lxd_observation__c': 'observacao',
-        'WorkOrder__r_Case_Owner_Name': 'proprietario_caso',
+        'WorkOrder__r_Case_Owner_Name': 'proprietario_caso', # <-- CORREÇÃO APLICADA AQUI
         'WorkOrder__r_Case_Area_de_atendimento__c': 'grupo',
         'WorkOrder__r_Case_Account_LXD_CPF__c': 'cpf_cnpj',
-        'WorkOrder__r_Criada_critica__c': 'criada_critica',
-        'WorkOrder__r_Priority2__c': 'prioridade2',
-        'WorkOrder__r_Tornou_se_critica__c': 'tornou_se_critica',
-        'WorkOrder__r_ReasonOfCriticality2__c': 'motivo_criticidade2',
-        'WorkOrder__r_Prioridade_por_Encaixe__c': 'prioridade_encaixe',
-        'WorkOrder__r_Periodo_solicita_encaixe__c': 'periodo_encaixe2',
-        'WorkOrder__r_ObservationOnPriority2__c': 'observacao_prioridade2',
-        'WorkOrder__r_Data_solicita_o_encaixe__c': 'data_encaixe2',
         'WorkOrder__r_Agendamento_Fura_Fila__c': 'agendamento_fura_fila'
     }
 
-    df.rename(columns=colunas_de_para, inplace=True)
+    # Renomeie as colunas do DataFrame
+    df_renomeado = all_results.rename(columns=colunas_de_para)
 
-    # garante todas as colunas do MySQL
-    for col in colunas_de_para.values():
-        if col not in df.columns:
-            df[col] = None
-
-    df = df[list(colunas_de_para.values())]
-
-    # remove colunas inválidas e NaN
-    df = df.loc[:, df.columns.notna()]
-    df.columns = df.columns.astype(str)
-    df = df.where(pd.notna(df), None)
-
-    # =====================================================
-    # MYSQL
-    # =====================================================
+    # df_renomeado.to_csv('richard.csv', index=False, encoding='utf-8' , sep=';')
     conn = conectar_mysql(
         host="172.29.5.3",
         database="db_Melhoria_continua_operacoes",
@@ -221,12 +179,19 @@ def etl_richard_critical():
     )
 
     if conn:
+        print("Conexão estabelecida com sucesso!")
+        df_renomeado.fillna("", inplace=True)
         cursor = conn.cursor()
-        cursor.execute("TRUNCATE TABLE servicos_tecnicos;")
+        query = "TRUNCATE TABLE servicos_tecnicos;"
+        cursor.execute(query)
         conn.commit()
 
-        insert_dataframe_mysql_direct(df, 'servicos_tecnicos', conn)
+        # Inserir DataFrame
+        sucesso = insert_dataframe_mysql_direct(df_renomeado, 'servicos_tecnicos', conn)
+        
+        if sucesso:
+            print("Dados inseridos com sucesso!")
+        
         conn.close()
-
-
+    
 etl_richard_critical()

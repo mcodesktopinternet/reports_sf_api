@@ -35,7 +35,7 @@ def etl_richard_critical():
 
 
     query = """
-    SELECT Id , WorkOrder.WorkOrderNumber, Field , CreatedBy.Name,  CreatedDate, OldValue, NewValue FROM WorkOrderHistory where Field = 'Priority' and CreatedDate >=2025-08-11T00:00:00.000-03:00
+    SELECT Id , WorkOrder.WorkOrderNumber, Field , CreatedBy.Name,  CreatedDate, OldValue, NewValue FROM WorkOrderHistory where (Field = 'Priority' or Field = 'Priority2__c') and CreatedDate >=2025-08-11T00:00:00.000-03:00
     """
         
 
