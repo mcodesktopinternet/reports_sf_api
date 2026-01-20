@@ -119,7 +119,7 @@ def get_sf_connection():
     client_id = "3MVG99gP.VbJma8WslD5o_qMP_J4iVg1FUTtQzWQ4_TxpBoZWi6MyFHtxCZMZFOCk2FsJbw2wNynhmaD7c8Uv"
     client_secret = "E31D29879301886FE62D60D79898EE335B488E0A37E4DDB9874D12F12C29719E"
     username = "plan.relatorios@desktop.net.br"
-    password = "PlanRelatorios@2025PwdjW2bnaqa3Z8O7KwuqVoLp"
+    password = "PlanRelatorios@2026Xo2zP5tjETV0fOLW5V6RZQBb"
 
     logging.info("Autenticando no Salesforce...")
     token_data = get_salesforce_token(domain, client_id, client_secret, username, password)
