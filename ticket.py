@@ -1,266 +1,321 @@
+import os
+import sys
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+
 import pandas as pd
 import requests
-import math
-from datetime import datetime
-from typing import Optional, List
-import warnings
+from dotenv import load_dotenv
 
-# Módulos locais
 from sf_auth import get_salesforce_token, get_auth_headers
 from sf_query import get_all_query_results
 from conectar_mysql import conectar_mysql, insert_dataframe_mysql_direct
 
-# Desabilita avisos de InsecureRequestWarning
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-warnings.simplefilter("ignore", InsecureRequestWarning)
+
+# -----------------------------------------------------------------------------
+# LOG
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("etl_ticket_api_cto")
 
 
-# ==============================================================================
-# CLIENTE API DESKTOP (token + retry)
-# ==============================================================================
+# -----------------------------------------------------------------------------
+# CONFIG HELPERS
+# -----------------------------------------------------------------------------
+def require_env(*keys: str) -> dict:
+    values = {}
+    missing = []
+    for k in keys:
+        v = os.getenv(k)
+        if v is None or str(v).strip() == "":
+            missing.append(k)
+        else:
+            values[k] = v
+    if missing:
+        raise RuntimeError(f"Variáveis obrigatórias ausentes no .env: {', '.join(missing)}")
+    return values
 
+
+def get_sf_config() -> dict:
+    return require_env(
+        "SF_DOMAIN",
+        "SF_CLIENT_ID",
+        "SF_CLIENT_SECRET",
+        "SF_USERNAME",
+        "SF_PASSWORD",
+    )
+
+
+def get_mysql_config() -> dict:
+    return require_env(
+        "MYSQL_HOST",
+        "MYSQL_DATABASE",
+        "MYSQL_USER",
+        "MYSQL_PASSWORD",
+    )
+
+
+def get_desktop_api_config() -> dict:
+    return require_env(
+        "DESKTOP_OAUTH_URL",
+        "DESKTOP_CLIENT_ID",
+        "DESKTOP_CLIENT_SECRET",
+        "DESKTOP_API_BASE",
+    )
+
+
+# -----------------------------------------------------------------------------
+# PARAMS (via env)
+# -----------------------------------------------------------------------------
+TZ_LOCAL = os.getenv("TZ_LOCAL", "America/Sao_Paulo").strip()
+MYSQL_TABLE = os.getenv("TICKET_TABLE", "ticket").strip()
+SF_API_VERSION = os.getenv("SF_API_VERSION", "65.0").strip()
+
+# desliga SSL verify? (apenas se realmente necessário)
+DESKTOP_VERIFY_SSL = os.getenv("DESKTOP_VERIFY_SSL", "0").strip()  # 1=verifica, 0=nao verifica
+
+# consulta SF (datas via env)
+SF_SCHED_END_FROM = os.getenv("SF_TICKET_SCHED_END_FROM", "2025-11-03T00:00:00.000-03:00").strip()
+
+
+# -----------------------------------------------------------------------------
+# SOQL
+# -----------------------------------------------------------------------------
+SOQL_QUERY = f"""
+SELECT
+    Id,
+    WorkOrder__r.Asset.SiglaCTO__c,
+    WorkOrder__r.Asset.CaixaCTO__c,
+    WorkOrder__r.Asset.PortaCTO__c,
+    WorkOrder__r.dt_abertura__c,
+    WorkOrder__r.LegacyId__c,
+    WorkOrder__r.WorkOrderNumber,
+    WorkOrder__r.Case.CaseNumber,
+    AppointmentNumber,
+    FirstScheduleDateTime__c,
+    WorkOrder__r.DataAgendamento__c,
+    ArrivalWindowStart_Gantt__c,
+    ArrivalWindowEnd_Gantt__c,
+    ScheduledStart_Gantt__c,
+    SchedEndTime_Gantt__c,
+    ActualStart_Gantt__c,
+    ActualEnd_Gantt__c,
+    TechnicianName__c,
+    TechniciansCompany__c,
+    WorkOrder__r.City,
+    WorkOrder__r.Work_Type_WO__c,
+    WorkOrder__r.Work_Subtype_WO__c,
+    WorkOrder__r.Status,
+    WorkOrder__r.CaseReason__c,
+    WorkOrder__r.Submotivo__c,
+    LowCodeFormula__c,
+    WorkOrder__r.ReasonForCancellationWorkOrder__c,
+    Reschedule_Reason_SA__c,
+    WorkOrder__r.SuspensionReasonWo__c,
+    WorkOrder__r.OLT__r.Name,
+    WorkOrder__r.CTO__c,
+    WorkOrder__r.Asset.Name,
+    WorkOrder__r.LastModifiedDate,
+    WorkOrder__r.Case.Account.LXD_CPF__c,
+    FSL__Pinned__c,
+    WorkOrder__r.IsRescheduledWo__c,
+    WorkOrder__r.ConvenienciaCliente__c,
+    WorkOrder__r.SolicitaAntecipacao__c,
+    WorkOrder__r.HowManyTimesWo__c,
+    WorkOrder__r.Subject,
+    StringPPoeUser__c
+FROM ServiceAppointment
+WHERE SchedEndTime_Gantt__c >= {SF_SCHED_END_FROM}
+  AND WorkOrder__r.Subject LIKE '%INC%'
+  AND Status = 'Concluída'
+  AND WorkOrder__r.Work_Type_WO__c = 'Manutenção'
+"""
+
+
+# -----------------------------------------------------------------------------
+# DESKTOP API CLIENT
+# -----------------------------------------------------------------------------
 class DesktopAPIClient:
-    def __init__(self):
+    def __init__(self, oauth_url: str, client_id: str, client_secret: str, api_base: str, verify_ssl: bool):
+        self.oauth_url = oauth_url
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.api_base = api_base.rstrip("/")
+
         self.session = requests.Session()
-        self.session.verify = False  # equivalente ao verify=False
+        self.session.verify = verify_ssl  # True/False
         self.token: Optional[str] = None
 
     def obter_token_oauth(self) -> Optional[str]:
-        """Obtém token de acesso OAuth2 da API Desktop."""
         try:
-            print(f"[{datetime.now()}] Iniciando obtenção do token OAuth da API Desktop...")
-            url = "https://oauth.desktop.com.br/v2/master/token"
+            logger.info("Obtendo token OAuth da API Desktop...")
             payload = {
                 "grant_type": "client_credentials",
-                "client_id": "smartomni",
-                "client_secret": "XwrP64b9FlEf6FfVYRqgT3JUPUzw72N1",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
             }
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
             }
 
-            resp = self.session.post(url, data=payload, headers=headers, timeout=600)
+            resp = self.session.post(self.oauth_url, data=payload, headers=headers, timeout=600)
             resp.raise_for_status()
 
             access_token = (resp.json().get("access_token") or "").strip()
             if not access_token:
-                print(f"[{datetime.now()}] ERRO: token veio vazio.")
+                logger.error("Token OAuth veio vazio.")
                 return None
 
             self.token = access_token
-            print(f"[{datetime.now()}] Token OAuth obtido com sucesso.")
+            logger.info("Token OAuth obtido com sucesso.")
             return self.token
 
         except requests.exceptions.RequestException as e:
-            print(f"[{datetime.now()}] ERRO CRÍTICO ao obter token OAuth: {e}")
+            logger.error("Erro crítico ao obter token OAuth: %s", e)
             return None
 
     def _headers(self) -> dict:
-        if not self.token:
-            return {"Accept": "application/json"}
-        return {
-            "Authorization": f"Bearer {self.token.strip()}",
-            "Accept": "application/json",
-        }
+        h = {"Accept": "application/json"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token.strip()}"
+        return h
 
     def consultar_cto_positions(self, numero_cto: str, sigla_cto: str) -> Optional[List[dict]]:
-        """
-        Consulta posições de uma CTO na API Desktop.
-        - Se der 401, renova token e tenta mais 1 vez.
-        - Se 404 retorna None.
-        """
         if not numero_cto or not sigla_cto:
             return None
 
-        url = f"https://api-v2.desktop.com.br/resource-inventory/v1/ctos/{numero_cto}/positions?group={sigla_cto}"
+        url = f"{self.api_base}/resource-inventory/v1/ctos/{numero_cto}/positions?group={sigla_cto}"
 
-        # garante token antes de chamar
-        if not self.token:
-            if not self.obter_token_oauth():
-                return None
+        if not self.token and not self.obter_token_oauth():
+            return None
 
-        # 1ª tentativa
         resp = self.session.get(url, headers=self._headers(), timeout=600)
 
-        # 404: CTO não encontrada (normal)
         if resp.status_code == 404:
             return None
 
-        # 401: token inválido/expirado -> renova e tenta de novo 1 vez
         if resp.status_code == 401:
-            print(f"[{datetime.now()}] 401 ao consultar CTO {sigla_cto}-{numero_cto}. Renovando token e tentando novamente...")
+            logger.warning("401 na CTO %s-%s. Renovando token e tentando 1x...", sigla_cto, numero_cto)
             if not self.obter_token_oauth():
-                print(f"[{datetime.now()}] Falha ao renovar token.")
                 return None
-
             resp = self.session.get(url, headers=self._headers(), timeout=600)
 
-        # 403/401 ainda: loga body pra entender motivo
         if resp.status_code in (401, 403):
-            print(f"[{datetime.now()}] AUTH ERROR {resp.status_code} CTO {sigla_cto}-{numero_cto}")
-            print("URL:", url)
-            print("Response body:", (resp.text or "")[:1000])
+            logger.error("AUTH ERROR %s CTO %s-%s | body: %s", resp.status_code, sigla_cto, numero_cto, (resp.text or "")[:600])
             return None
 
         try:
             resp.raise_for_status()
             data = resp.json()
-            # Esperado: lista
             return data if isinstance(data, list) else None
         except Exception as e:
-            print(f"[{datetime.now()}] AVISO: erro lendo JSON CTO {sigla_cto}-{numero_cto}: {e}")
-            print("Body:", (resp.text or "")[:500])
+            logger.warning("Erro lendo JSON CTO %s-%s: %s | body: %s", sigla_cto, numero_cto, e, (resp.text or "")[:500])
             return None
 
 
-# ==============================================================================
-# FUNÇÃO PRINCIPAL DO ETL
-# ==============================================================================
+# -----------------------------------------------------------------------------
+# TRANSFORM
+# -----------------------------------------------------------------------------
+COLUNAS_DE_PARA = {
+    "Id": "id_service_appointment",
+    "WorkOrder__r_Asset_SiglaCTO__c": "sigla_cto",
+    "WorkOrder__r_Asset_CaixaCTO__c": "caixa_cto",
+    "WorkOrder__r_Asset_PortaCTO__c": "porta_cto",
+    "WorkOrder__r_dt_abertura__c": "dt_abertura",
+    "WorkOrder__r_LegacyId__c": "codigo_cliente",
+    "WorkOrder__r_WorkOrderNumber": "numero_ordem_trabalho",
+    "WorkOrder__r_Case_CaseNumber": "caso",
+    "AppointmentNumber": "numero_compromisso",
+    "FirstScheduleDateTime__c": "data_primeiro_agendamento",
+    "WorkOrder__r_DataAgendamento__c": "data_agendamento",
+    "ArrivalWindowStart_Gantt__c": "inicio_janela_chegada",
+    "ArrivalWindowEnd_Gantt__c": "termino_janela_chegada",
+    "ScheduledStart_Gantt__c": "inicio_agendado",
+    "SchedEndTime_Gantt__c": "termino_agendado",
+    "ActualStart_Gantt__c": "inicio_servico",
+    "ActualEnd_Gantt__c": "termino_servico",
+    "TechnicianName__c": "nome_tecnico",
+    "TechniciansCompany__c": "empresa_tecnico",
+    "WorkOrder__r_City": "cidade",
+    "WorkOrder__r_Work_Type_WO__c": "tipo_trabalho",
+    "WorkOrder__r_Work_Subtype_WO__c": "subtipo_trabalho",
+    "WorkOrder__r_Status": "status",
+    "WorkOrder__r_CaseReason__c": "motivo_caso",
+    "WorkOrder__r_Submotivo__c": "submotivo_caso",
+    "LowCodeFormula__c": "codigo_baixa",
+    "WorkOrder__r_ReasonForCancellationWorkOrder__c": "motivo_cancelamento",
+    "Reschedule_Reason_SA__c": "motivo_reagendamento",
+    "WorkOrder__r_SuspensionReasonWo__c": "motivo_suspensao",
+    "WorkOrder__r_OLT__r_Name": "olt",
+    "WorkOrder__r_CTO__c": "cto",
+    "WorkOrder__r_Asset_Name": "ativo",
+    "WorkOrder__r_LastModifiedDate": "last_modified_date",
+    "WorkOrder__r_Case_Account_LXD_CPF__c": "cpf_cnpj",
+    "FSL__Pinned__c": "pinned",
+    "WorkOrder__r_IsRescheduledWo__c": "foi_reagendado",
+    "WorkOrder__r_ConvenienciaCliente__c": "conveniencia_cliente",
+    "WorkOrder__r_SolicitaAntecipacao__c": "solicita_antecipacao",
+    "WorkOrder__r_HowManyTimesWo__c": "quantas_vezes",
+    "WorkOrder__r_Subject": "subject",
+    "StringPPoeUser__c": "pppoe",
+}
 
-def etl_base_corrigida():
-    # 1. AUTENTICAÇÃO E CONFIGURAÇÃO (Salesforce)
-    # =================================================
-    domain = "https://desktopsa.my.salesforce.com"
-    client_id = "3MVG99gP.VbJma8WslD5o_qMP_J4iVg1FUTtQzWQ4_TxpBoZWi6MyFHtxCZMZFOCk2FsJbw2wNynhmaD7c8Uv"
-    client_secret = "E31D29879301886FE62D60D79898EE335B488E0A37E4DDB9874D12F12C29719E"
-    username = "plan.relatorios@desktop.net.br"
-    password = "PlanRelatorios@2025PwdjW2bnaqa3Z8O7KwuqVoLp"
+COLUNAS_DATA = [
+    "dt_abertura",
+    "data_agendamento",
+    "inicio_janela_chegada",
+    "termino_janela_chegada",
+    "inicio_agendado",
+    "termino_agendado",
+    "inicio_servico",
+    "termino_servico",
+    "last_modified_date",
+    "ultima_conexao_inicio",
+    "ultima_conexao_fim",
+]
 
-    print(f"[{datetime.now()}] Iniciando autenticação com o Salesforce...")
-    token_data = get_salesforce_token(domain, client_id, client_secret, username, password)
-    headers_sf = get_auth_headers(token_data)
-    print(f"[{datetime.now()}] Autenticação com Salesforce bem-sucedida.")
+COLUNAS_NUM = ["quantas_vezes", "pinned", "conveniencia_cliente", "solicita_antecipacao"]
 
-    # 2. Cliente Desktop API (com token + retry)
-    desktop_api = DesktopAPIClient()
-    if not desktop_api.obter_token_oauth():
-        print(f"[{datetime.now()}] CRÍTICO: Não foi possível obter o token da API Desktop. Encerrando.")
-        return
 
-    # 3. EXTRAÇÃO DE DADOS DO SALESFORCE
-    # =================================================
-    query = """
-    SELECT Id, WorkOrder__r.Asset.SiglaCTO__c, WorkOrder__r.Asset.CaixaCTO__c, WorkOrder__r.Asset.PortaCTO__c,
-           WorkOrder__r.dt_abertura__c, WorkOrder__r.LegacyId__c, WorkOrder__r.WorkOrderNumber, WorkOrder__r.Case.CaseNumber,
-           AppointmentNumber, FirstScheduleDateTime__c, WorkOrder__r.DataAgendamento__c, ArrivalWindowStart_Gantt__c,
-           ArrivalWindowEnd_Gantt__c, ScheduledStart_Gantt__c, SchedEndTime_Gantt__c, ActualStart_Gantt__c, ActualEnd_Gantt__c,
-           TechnicianName__c, TechniciansCompany__c, WorkOrder__r.City, WorkOrder__r.Work_Type_WO__c, WorkOrder__r.Work_Subtype_WO__c,
-           WorkOrder__r.Status, WorkOrder__r.CaseReason__c, WorkOrder__r.Submotivo__c, LowCodeFormula__c,
-           WorkOrder__r.ReasonForCancellationWorkOrder__c, Reschedule_Reason_SA__c, WorkOrder__r.SuspensionReasonWo__c,
-           WorkOrder__r.OLT__r.Name, WorkOrder__r.CTO__c, WorkOrder__r.Asset.Name, WorkOrder__r.LastModifiedDate,
-           WorkOrder__r.Case.Account.LXD_CPF__c, FSL__Pinned__c, WorkOrder__r.IsRescheduledWo__c,
-           WorkOrder__r.ConvenienciaCliente__c, WorkOrder__r.SolicitaAntecipacao__c, WorkOrder__r.HowManyTimesWo__c, WorkOrder__r.Subject, StringPPoeUser__c
-    FROM ServiceAppointment 
-    WHERE SchedEndTime_Gantt__c >= 2025-11-03T00:00:00.000-03:00 
-      AND WorkOrder__r.Subject LIKE '%INC%' AND Status = 'Concluída' AND WorkOrder__r.Work_Type_WO__c  = 'Manutenção'
-    """
-
-    print(f"[{datetime.now()}] Executando a consulta no Salesforce...")
-    resultado = get_all_query_results(domain, headers_sf, query)
-    total_registros = len(resultado)
-    print(f"[{datetime.now()}] Consulta retornou {total_registros} registros.")
-    if not total_registros:
-        print(f"[{datetime.now()}] Nenhum registro encontrado. Encerrando.")
-        return
-
-    # 4. PREPARAÇÃO DO BANCO DE DADOS
-    # =================================================
-    conn = conectar_mysql(
-        host="172.29.5.3",
-        database="db_Melhoria_continua_operacoes",
-        user="murylo.marques",
-        password="Murylobk10x12",
-    )
-    if not conn:
-        print(f"[{datetime.now()}] CRÍTICO: Falha na conexão com MySQL. Encerrando.")
-        return
-
-    colunas_mysql = set()
+def _parse_api_datetime_br(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
     try:
-        with conn.cursor() as cursor:
-            print(f"[{datetime.now()}] Conexão com MySQL estabelecida. Verificando colunas...")
-            cursor.execute("SHOW COLUMNS FROM ticket;")
-            colunas_mysql = {row[0] for row in cursor.fetchall()}
+        return datetime.strptime(value, "%d/%m/%Y - %H:%M:%S")
+    except Exception:
+        return None
 
-            print(f"[{datetime.now()}] Limpando a tabela 'ticket' (TRUNCATE)...")
-            cursor.execute("TRUNCATE TABLE ticket;")
-        conn.commit()
-        print(f"[{datetime.now()}] Tabela 'ticket' limpa.")
-    except Exception as e:
-        print(f"[{datetime.now()}] ERRO durante preparação do banco: {e}")
-        conn.close()
-        return
 
-    # 5. TRANSFORMAÇÃO
-    # =================================================
-    df_total = pd.json_normalize(resultado, sep="_")
-    df_total = df_total.drop(columns=[c for c in df_total.columns if "attributes_" in c], errors="ignore")
+def enriquecer_cto(df: pd.DataFrame, desktop_api: DesktopAPIClient) -> pd.DataFrame:
+    logger.info("Enriquecendo %s registros via API Desktop (CTO positions)...", len(df))
 
-    colunas_de_para = {
-        "Id": "id_service_appointment",
-        "WorkOrder__r_Asset_SiglaCTO__c": "sigla_cto",
-        "WorkOrder__r_Asset_CaixaCTO__c": "caixa_cto",
-        "WorkOrder__r_Asset_PortaCTO__c": "porta_cto",
-        "WorkOrder__r_dt_abertura__c": "dt_abertura",
-        "WorkOrder__r_LegacyId__c": "codigo_cliente",
-        "WorkOrder__r_WorkOrderNumber": "numero_ordem_trabalho",
-        "WorkOrder__r_Case_CaseNumber": "caso",
-        "AppointmentNumber": "numero_compromisso",
-        "FirstScheduleDateTime__c": "data_primeiro_agendamento",
-        "WorkOrder__r_DataAgendamento__c": "data_agendamento",
-        "ArrivalWindowStart_Gantt__c": "inicio_janela_chegada",
-        "ArrivalWindowEnd_Gantt__c": "termino_janela_chegada",
-        "ScheduledStart_Gantt__c": "inicio_agendado",
-        "SchedEndTime_Gantt__c": "termino_agendado",
-        "ActualStart_Gantt__c": "inicio_servico",
-        "ActualEnd_Gantt__c": "termino_servico",
-        "TechnicianName__c": "nome_tecnico",
-        "TechniciansCompany__c": "empresa_tecnico",
-        "WorkOrder__r_City": "cidade",
-        "WorkOrder__r_Work_Type_WO__c": "tipo_trabalho",
-        "WorkOrder__r_Work_Subtype_WO__c": "subtipo_trabalho",
-        "WorkOrder__r_Status": "status",
-        "WorkOrder__r_CaseReason__c": "motivo_caso",
-        "WorkOrder__r_Submotivo__c": "submotivo_caso",
-        "LowCodeFormula__c": "codigo_baixa",
-        "WorkOrder__r_ReasonForCancellationWorkOrder__c": "motivo_cancelamento",
-        "Reschedule_Reason_SA__c": "motivo_reagendamento",
-        "WorkOrder__r_SuspensionReasonWo__c": "motivo_suspensao",
-        "WorkOrder__r_OLT__r_Name": "olt",
-        "WorkOrder__r.CTO__c": "cto",
-        "WorkOrder__r_Asset_Name": "ativo",
-        "WorkOrder__r_LastModifiedDate": "last_modified_date",
-        "WorkOrder__r_Case_Account_LXD_CPF__c": "cpf_cnpj",
-        "FSL__Pinned__c": "pinned",
-        "WorkOrder__r_IsRescheduledWo__c": "foi_reagendado",
-        "WorkOrder__r_ConvenienciaCliente__c": "conveniencia_cliente",
-        "WorkOrder__r_SolicitaAntecipacao__c": "solicita_antecipacao",
-        "WorkOrder__r_HowManyTimesWo__c": "quantas_vezes",
-        "WorkOrder__r_Subject": "subject",
-        "StringPPoeUser__c": "pppoe"
-    }
-    df_total.rename(columns=colunas_de_para, inplace=True)
+    status_list: List[str] = []
+    inicio_list: List[Optional[datetime]] = []
+    fim_list: List[Optional[datetime]] = []
+    duracao_list: List[Optional[str]] = []
 
-    # 6. ENRIQUECIMENTO COM API (CTO)
-    # =================================================
-    print(f"[{datetime.now()}] Buscando dados de conexão na API para {total_registros} registros...")
+    now = datetime.now()
 
-    api_data = []
-    for _, row in df_total.iterrows():
+    for _, row in df.iterrows():
         sigla = row.get("sigla_cto")
         caixa = row.get("caixa_cto")
-        porta_str = row.get("porta_cto")
+        porta_raw = row.get("porta_cto")
 
         status = "Dados insuficientes"
         inicio = None
         fim = None
         duracao = None
 
-        if sigla and caixa and porta_str:
+        if sigla and caixa and porta_raw:
             try:
-                porta_num = int(float(porta_str))
-            except (ValueError, TypeError):
+                porta_num = int(float(porta_raw))
+            except Exception:
                 status = "Porta inválida"
             else:
                 resp_api = desktop_api.consultar_cto_positions(str(caixa).strip(), str(sigla).strip())
@@ -270,77 +325,161 @@ def etl_base_corrigida():
                     for porta_info in resp_api:
                         if porta_info.get("port_number") == porta_num:
                             status = porta_info.get("status", "Status não informado")
-                            inicio_str = porta_info.get("last_connection_start")
-                            fim_str = porta_info.get("last_connection_stop")
 
-                            try:
-                                if inicio_str:
-                                    dt_inicio = datetime.strptime(inicio_str, "%d/%m/%Y - %H:%M:%S")
-                                    inicio = dt_inicio
-                                    if status == "Conectado":
-                                        d, r = divmod((datetime.now() - dt_inicio).total_seconds(), 86400)
-                                        h, r = divmod(r, 3600)
-                                        m, _ = divmod(r, 60)
-                                        duracao = f"{int(d)}d {int(h)}h {int(m)}m"
+                            inicio = _parse_api_datetime_br(porta_info.get("last_connection_start"))
+                            fim = _parse_api_datetime_br(porta_info.get("last_connection_stop"))
 
-                                if fim_str:
-                                    dt_fim = datetime.strptime(fim_str, "%d/%m/%Y - %H:%M:%S")
-                                    fim = dt_fim
-                            except (ValueError, TypeError):
-                                pass
+                            if inicio and status == "Conectado":
+                                secs = (now - inicio).total_seconds()
+                                d, r = divmod(secs, 86400)
+                                h, r = divmod(r, 3600)
+                                m, _ = divmod(r, 60)
+                                duracao = f"{int(d)}d {int(h)}h {int(m)}m"
+
                             break
                 else:
                     status = "CTO não encontrada"
 
-        api_data.append([status, inicio, fim, duracao])
+        status_list.append(status)
+        inicio_list.append(inicio)
+        fim_list.append(fim)
+        duracao_list.append(duracao)
 
-    df_total[["status_cliente_api", "ultima_conexao_inicio", "ultima_conexao_fim", "tempo_conectado"]] = api_data
-    print(f"[{datetime.now()}] Busca de dados na API concluída.")
+    df["status_cliente_api"] = status_list
+    df["ultima_conexao_inicio"] = inicio_list
+    df["ultima_conexao_fim"] = fim_list
+    df["tempo_conectado"] = duracao_list
 
-    # 7. TIPOS (datas e números)
-    # =================================================
-    colunas_data = [
-        "dt_abertura",
-        "data_agendamento",
-        "inicio_janela_chegada",
-        "termino_janela_chegada",
-        "inicio_agendado",
-        "termino_agendado",
-        "inicio_servico",
-        "termino_servico",
-        "last_modified_date",
-        "ultima_conexao_inicio",
-        "ultima_conexao_fim",
-    ]
+    return df
 
-    for col in colunas_data:
-        if col in df_total.columns:
-            df_total[col] = pd.to_datetime(df_total[col], errors="coerce", utc=True)
-            df_total[col] = df_total[col].dt.tz_convert("America/Sao_Paulo")
-            df_total[col] = df_total[col].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    colunas_numericas = ["quantas_vezes", "pinned", "conveniencia_cliente", "solicita_antecipacao"]
-    for col in colunas_numericas:
-        if col in df_total.columns:
-            df_total[col] = pd.to_numeric(df_total[col], errors="coerce").fillna(0).astype(int)
+def ajustar_tipos(df: pd.DataFrame) -> pd.DataFrame:
+    # datas: tenta parse e converte para TZ_LOCAL, depois string "YYYY-mm-dd HH:MM:SS"
+    for col in COLUNAS_DATA:
+        if col in df.columns:
+            dt = pd.to_datetime(df[col], errors="coerce", utc=True)
+            # se for datetime "naive" (caso API BR), cai como NaT no utc=True -> então tenta sem utc
+            if dt.isna().all():
+                dt = pd.to_datetime(df[col], errors="coerce")
+                df[col] = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                df[col] = dt.dt.tz_convert(TZ_LOCAL).dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    df_final = df_total.astype(object).where(pd.notnull(df_total), None)
+    for col in COLUNAS_NUM:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    # 8. CARGA NO MYSQL
-    # =================================================
-    df_para_inserir = df_final[[c for c in df_final.columns if c in colunas_mysql]]
+    return df.astype(object).where(pd.notna(df), None)
 
-    print(f"[{datetime.now()}] Colunas a serem inseridas: {list(df_para_inserir.columns)}")
-    print(f"[{datetime.now()}] Iniciando inserção de {len(df_para_inserir)} registros...")
+
+# -----------------------------------------------------------------------------
+# ETL
+# -----------------------------------------------------------------------------
+def sf_login() -> Tuple[str, dict]:
+    sf = get_sf_config()
+    logger.info("Autenticando no Salesforce...")
+    token_data = get_salesforce_token(
+        domain=sf["SF_DOMAIN"],
+        client_id=sf["SF_CLIENT_ID"],
+        client_secret=sf["SF_CLIENT_SECRET"],
+        username=sf["SF_USERNAME"],
+        password=sf["SF_PASSWORD"],
+    )
+    headers = get_auth_headers(token_data)
+    instance_url = token_data.get("instance_url") or sf["SF_DOMAIN"]
+    return instance_url, headers
+
+
+def mysql_prepare() -> Tuple[object, set]:
+    mysql = get_mysql_config()
+    logger.info("Conectando no MySQL (%s/%s)...", mysql["MYSQL_HOST"], mysql["MYSQL_DATABASE"])
+
+    conn = conectar_mysql(
+        host=mysql["MYSQL_HOST"],
+        database=mysql["MYSQL_DATABASE"],
+        user=mysql["MYSQL_USER"],
+        password=mysql["MYSQL_PASSWORD"],
+    )
+    if not conn:
+        raise RuntimeError("Falha na conexão MySQL.")
+
+    colunas_mysql = set()
+    with conn.cursor() as cursor:
+        logger.info("Lendo colunas de %s...", MYSQL_TABLE)
+        cursor.execute(f"SHOW COLUMNS FROM {MYSQL_TABLE};")
+        colunas_mysql = {row[0] for row in cursor.fetchall()}
+
+        logger.info("TRUNCATE %s...", MYSQL_TABLE)
+        cursor.execute(f"TRUNCATE TABLE {MYSQL_TABLE};")
+    conn.commit()
+
+    return conn, colunas_mysql
+
+
+def etl_base_corrigida():
+    load_dotenv()
+
+    desktop_cfg = get_desktop_api_config()
+    verify_ssl = DESKTOP_VERIFY_SSL == "1"
+
+    # 1) Login SF
+    instance_url, headers_sf = sf_login()
+
+    # 2) Cliente Desktop API
+    desktop_api = DesktopAPIClient(
+        oauth_url=desktop_cfg["DESKTOP_OAUTH_URL"],
+        client_id=desktop_cfg["DESKTOP_CLIENT_ID"],
+        client_secret=desktop_cfg["DESKTOP_CLIENT_SECRET"],
+        api_base=desktop_cfg["DESKTOP_API_BASE"],
+        verify_ssl=verify_ssl,
+    )
+    if not desktop_api.obter_token_oauth():
+        logger.error("Não foi possível obter token da API Desktop. Encerrando.")
+        return
+
+    # 3) Extrai do Salesforce
+    logger.info("Executando consulta Salesforce...")
+    records = get_all_query_results(
+        instance_url=instance_url,
+        auth_headers=headers_sf,
+        query=SOQL_QUERY,
+    )
+    logger.info("Consulta retornou %s registros.", len(records))
+    if not records:
+        logger.warning("Nenhum registro encontrado. Encerrando.")
+        return
+
+    # 4) Prepara MySQL
+    conn, colunas_mysql = mysql_prepare()
 
     try:
-        insert_dataframe_mysql_direct(df_para_inserir, "ticket", conn)
-        print(f"[{datetime.now()}] Inserção concluída com sucesso.")
+        # 5) Transform
+        df = pd.json_normalize(records, sep="_")
+        df = df.drop(columns=[c for c in df.columns if "attributes_" in c], errors="ignore")
+        df = df.rename(columns=COLUNAS_DE_PARA)
+
+        # 6) Enriquecimento API CTO
+        df = enriquecer_cto(df, desktop_api)
+
+        # 7) Ajustes de tipo
+        df = ajustar_tipos(df)
+
+        # 8) Carga (somente colunas existentes)
+        cols_to_insert = [c for c in df.columns if c in colunas_mysql]
+        df_insert = df[cols_to_insert]
+
+        logger.info("Colunas a inserir (%s): %s", len(cols_to_insert), cols_to_insert)
+        logger.info("Inserindo %s registros em %s...", len(df_insert), MYSQL_TABLE)
+
+        insert_dataframe_mysql_direct(df_insert, MYSQL_TABLE, conn)
+        logger.info("Inserção concluída com sucesso ✅")
+
     except Exception as e:
-        print(f"[{datetime.now()}] FALHA CRÍTICA DURANTE A INSERÇÃO: {e}")
+        logger.error("Falha crítica durante ETL: %s", e)
+        raise
     finally:
         conn.close()
-        print(f"[{datetime.now()}] Conexão com o MySQL fechada. Processo concluído.")
+        logger.info("Conexão MySQL fechada. Processo concluído.")
 
 
 if __name__ == "__main__":
